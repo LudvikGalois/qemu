@@ -16,6 +16,7 @@
 #include "qemu/osdep.h"
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <unistd.h>
 
 #include <linux/kvm.h>
 
@@ -105,6 +106,8 @@ struct KVMState
     int nr_slots;
     int fd;
     int vmfd;
+    char *kvm_stats_socket;
+    QemuThread stats_thread;
     int coalesced_mmio;
     int coalesced_pio;
     struct kvm_coalesced_mmio_ring *coalesced_mmio_ring;
@@ -201,6 +204,93 @@ static QemuMutex kml_slots_lock;
 #define kvm_slots_unlock()  qemu_mutex_unlock(&kml_slots_lock)
 
 static void kvm_slot_init_dirty_bitmap(KVMSlot *mem);
+
+/*
+ * Both splice and sendfile fail to work with the stats
+ * pseudo-file
+ */
+static int kvm_copy_stats_to_file(int out_fd, int stats_fd)
+{
+    const int BUF_SIZE = 4096;
+    char buf[BUF_SIZE];
+    ssize_t bytes_read = 1;
+    off_t total_bytes_read = 0;
+    while (bytes_read > 0) {
+        bytes_read = pread(stats_fd, buf, BUF_SIZE, total_bytes_read);
+        if (bytes_read < 0) {
+            return bytes_read;
+        }
+        total_bytes_read += bytes_read;
+        int to_write = bytes_read;
+        while (to_write) {
+            int bytes_written = write(out_fd, buf, to_write);
+            if (bytes_written < 0) {
+                return bytes_written;
+            }
+            to_write -= bytes_written;
+        }
+    }
+    return 0;
+}
+
+static void *kvm_run_vm_stats_server(void *opaque)
+{
+    KVMState *s = opaque;
+
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, s->kvm_stats_socket, sizeof(addr.sun_path) - 1);
+    /* TODO check we're not unlinking a regular file */
+    unlink(s->kvm_stats_socket);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        fprintf(stderr, "Error: Unable to bind kvm stats socket\n");
+        return NULL;
+    }
+
+    int vm_stats_fd = 0;
+    /* We need to cater for the maximum number of vcpus to handle
+     * additional vcpus being hotloaded
+     */
+    const int max_vcpus = kvm_check_extension(s, KVM_CAP_MAX_VCPUS);
+    int vcpu_stats_fd[max_vcpus];
+    memset(vcpu_stats_fd, 0, sizeof(vcpu_stats_fd));
+    if (listen(server_fd, SOMAXCONN) == -1) {
+        fprintf(stderr, "Error: unable to listen on stats socket\n");
+        close(server_fd);
+        return NULL;
+    }
+    for (;;) {
+        int err = 0;
+        int session_fd = accept(server_fd, NULL, NULL);
+        if (session_fd <= 0) {
+            /* something went wrong with the connection */
+            continue;
+        }
+        if (!vm_stats_fd) {
+            vm_stats_fd = kvm_vm_ioctl(s, KVM_GET_STATS_FD, 0);
+        }
+        err = kvm_copy_stats_to_file(session_fd, vm_stats_fd);
+        if (err) {
+            /* Something went wrong */
+        }
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            int cpu_id = cpu->cpu_index;
+            if (!vcpu_stats_fd[cpu_id]) {
+                vcpu_stats_fd[cpu_id] = kvm_vcpu_ioctl(cpu, KVM_GET_STATS_FD, 0);
+            }
+            err = kvm_copy_stats_to_file(session_fd, vcpu_stats_fd[cpu_id]);
+            if (err) {
+                /* Something went wrong */
+            }
+        }
+        close(session_fd);
+    }
+    close(server_fd);
+    return NULL;
+}
 
 static inline void kvm_resample_fd_remove(int gsi)
 {
@@ -2612,6 +2702,14 @@ static int kvm_init(MachineState *ms)
         }
     }
 
+    if (s->kvm_stats_socket != NULL) {
+        if (!kvm_check_extension(kvm_state, KVM_CAP_BINARY_STATS_FD)) {
+            error_report("Capturing KVM statistics not supported");
+            goto err;
+        }
+        qemu_thread_create(&s->stats_thread, "vm-stats-server", &kvm_run_vm_stats_server, s, 0);
+    }
+
     return 0;
 
 err:
@@ -3613,6 +3711,13 @@ static void kvm_set_dirty_ring_size(Object *obj, Visitor *v,
     s->kvm_dirty_ring_size = value;
 }
 
+static void kvm_set_kvm_stats_socket(Object *obj, const char *str,
+                                     Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+    s->kvm_stats_socket = g_strdup(str);
+}
+
 static void kvm_accel_instance_init(Object *obj)
 {
     KVMState *s = KVM_STATE(obj);
@@ -3624,6 +3729,7 @@ static void kvm_accel_instance_init(Object *obj)
     s->kernel_irqchip_split = ON_OFF_AUTO_AUTO;
     /* KVM dirty ring is by default off */
     s->kvm_dirty_ring_size = 0;
+    s->kvm_stats_socket = NULL;
 }
 
 static void kvm_accel_class_init(ObjectClass *oc, void *data)
@@ -3651,6 +3757,11 @@ static void kvm_accel_class_init(ObjectClass *oc, void *data)
         NULL, NULL);
     object_class_property_set_description(oc, "dirty-ring-size",
         "Size of KVM dirty page ring buffer (default: 0, i.e. use bitmap)");
+
+    object_class_property_add_str(oc, "kvm-stats-socket",
+        NULL, kvm_set_kvm_stats_socket);
+    object_class_property_set_description(oc, "kvm-stats-socket",
+        "Export kvm stats to a unix domain socket");
 }
 
 static const TypeInfo kvm_accel_type = {
